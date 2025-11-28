@@ -100,8 +100,8 @@ class GridTradingBacktest {
         throw new Error("Fiyat verisi alinamadi - bos yanit");
       }
     } catch (error) {
-      console.error("API Hatasi:", error);
-      throw error;
+      console.error("API Hatasi:", error.message || error);
+      throw new Error("API Hatasi: " + (error.message || JSON.stringify(error)));
     }
   }
 
