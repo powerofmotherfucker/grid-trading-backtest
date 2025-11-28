@@ -2,15 +2,19 @@
 // Cross Margin Kripto Para Grid Trading Backtest Sistemi
 
 // ==================== KULLANICI AYARLARI ====================
-// >>>>>> SADECE BU 4 DEGERI DEGISTIR <<<<<<
+// >>>>>> DEGISTIRILECEK PARAMETRELER <<<<<<
 const CONFIG = {
-  // -------- DEGISTIRILECEK PARAMETRELER --------
+  // -------- TEMEL PARAMETRELER --------
   coinId: "bitcoin",       // DEGISTIR: "bitcoin", "ethereum", "solana", "zcash", "ripple", "dogecoin"
   daysAgo: 30,             // DEGISTIR: Kac gun oncesinden baslasin (1, 7, 14, 30, 90)
   lowerPrice: null,        // BURAYA YAZ: Alt fiyat ($) - ornek: 85000
   upperPrice: null,        // BURAYA YAZ: Ust fiyat ($) - ornek: 100000
 
-  // -------- SABIT PARAMETRELER (DOKUNMA) --------
+  // -------- MARGIN VE MOD AYARLARI --------
+  marginType: "cross",     // Her zaman Cross Margin
+  gridMode: "neutral",     // "neutral" = Long+Short (cift yonlu), "long" = Sadece Long, "short" = Sadece Short
+
+  // -------- DIGER PARAMETRELER --------
   vsCurrency: "usd",
   gridCount: 75,
   totalBalance: 1000,
@@ -52,17 +56,24 @@ class GridTradingBacktest {
       const price = lowerPrice + gridStep * i;
       this.gridLevels.push({
         price: price,
-        hasBuyOrder: true,
-        hasSellOrder: false,
-        entryPrice: null,
-        entryFee: 0,
-        quantity: 0,
-        marginUsed: 0,
-        targetSellPrice: price + gridStep,
-        trailingActivated: false,
-        trailingHighPrice: null,
-        trailingLowPrice: null,
-        trailingTakeProfit: null,
+        // Long pozisyon icin
+        hasLongBuyOrder: true,
+        hasLongSellOrder: false,
+        longEntryPrice: null,
+        longEntryFee: 0,
+        longQuantity: 0,
+        longTargetPrice: price + gridStep,
+        longTrailingHigh: null,
+        longTrailingLow: null,
+        // Short pozisyon icin
+        hasShortSellOrder: true,
+        hasShortBuyOrder: false,
+        shortEntryPrice: null,
+        shortEntryFee: 0,
+        shortQuantity: 0,
+        shortTargetPrice: price - gridStep,
+        shortTrailingLow: null,
+        shortTrailingHigh: null,
       });
     }
 
@@ -148,7 +159,11 @@ class GridTradingBacktest {
       leverage,
       trailingUpPercent,
       trailingDownPercent,
+      gridMode,
     } = this.config;
+
+    const canLong = gridMode === "neutral" || gridMode === "long";
+    const canShort = gridMode === "neutral" || gridMode === "short";
 
     for (let i = 0; i < priceData.length; i++) {
       const currentPrice = priceData[i].price;
@@ -158,38 +173,33 @@ class GridTradingBacktest {
       for (let j = 0; j < this.gridLevels.length; j++) {
         const grid = this.gridLevels[j];
 
-        // ALIS MANTIGI: Fiyat grid seviyesine veya altina dustuyse ve buy order aktifse
+        // =============== LONG POZISYON MANTIGI ===============
+        // LONG ALIS: Fiyat grid seviyesine veya altina dustuyse
         if (
-          grid.hasBuyOrder &&
+          canLong &&
+          grid.hasLongBuyOrder &&
           currentPrice <= grid.price &&
           currentPrice >= this.config.lowerPrice
         ) {
-          // Pozisyon buyuklugu (coin miktari)
           const quantity = this.notionalPerGrid / currentPrice;
-
-          // Giris ucreti (notional deger uzerinden)
           const entryFee = (this.notionalPerGrid * tradingFeePercent) / 100;
 
-          grid.entryPrice = currentPrice;
-          grid.entryFee = entryFee;
-          grid.quantity = quantity;
-          grid.marginUsed = this.marginPerGrid;
-          grid.hasBuyOrder = false;
-          grid.hasSellOrder = true;
-          grid.targetSellPrice = grid.price + this.gridStep;
-          grid.trailingActivated = true;
-          grid.trailingHighPrice = currentPrice;
-          grid.trailingLowPrice =
-            currentPrice * (1 - trailingDownPercent / 100);
-          grid.trailingTakeProfit = null;
+          grid.longEntryPrice = currentPrice;
+          grid.longEntryFee = entryFee;
+          grid.longQuantity = quantity;
+          grid.hasLongBuyOrder = false;
+          grid.hasLongSellOrder = true;
+          grid.longTargetPrice = grid.price + this.gridStep;
+          grid.longTrailingHigh = currentPrice;
+          grid.longTrailingLow = currentPrice * (1 - trailingDownPercent / 100);
 
-          // Cross margin: Fee marjinden dusulur
           this.balance -= entryFee;
           this.totalFees += entryFee;
           this.currentPosition += quantity;
 
           this.trades.push({
-            type: "BUY",
+            type: "LONG_BUY",
+            direction: "LONG",
             price: currentPrice,
             quantity: quantity,
             notional: this.notionalPerGrid,
@@ -199,103 +209,189 @@ class GridTradingBacktest {
           });
         }
 
-        // SATIS MANTIGI: Pozisyon aciksa ve fiyat hedef satis fiyatina ulastiysa
-        if (grid.hasSellOrder && grid.entryPrice !== null) {
-          let shouldSell = false;
-          let sellType = "SELL";
+        // LONG SATIS: Fiyat hedef fiyata ulasti veya trailing tetiklendi
+        if (canLong && grid.hasLongSellOrder && grid.longEntryPrice !== null) {
+          let shouldClose = false;
+          let closeType = "LONG_SELL";
 
-          // Normal grid satisi: Fiyat hedef satis fiyatina (bir ust grid) ulasti
-          if (currentPrice >= grid.targetSellPrice) {
-            shouldSell = true;
-            sellType = "SELL";
+          if (currentPrice >= grid.longTargetPrice) {
+            shouldClose = true;
           }
 
-          // Trailing stop kontrolu
-          const trailingCheck = this.checkTrailingStop(grid, currentPrice);
-          if (trailingCheck.triggered) {
-            shouldSell = true;
-            sellType =
-              trailingCheck.type === "take_profit"
-                ? "TAKE_PROFIT"
-                : "STOP_LOSS";
+          // Trailing kontrolu (Long icin)
+          if (currentPrice > grid.longTrailingHigh) {
+            grid.longTrailingHigh = currentPrice;
+            grid.longTrailingLow = currentPrice * (1 - trailingDownPercent / 100);
+          }
+          if (currentPrice <= grid.longTrailingLow) {
+            shouldClose = true;
+            closeType = currentPrice > grid.longEntryPrice ? "LONG_TP" : "LONG_SL";
           }
 
-          if (shouldSell) {
-            const sellPrice = currentPrice;
-            const quantity = grid.quantity;
-
-            // Gercek PnL hesabi
-            const priceDiff = sellPrice - grid.entryPrice;
-            const grossPnL = priceDiff * quantity;
-
-            // Cikis ucreti
-            const exitNotional = sellPrice * quantity;
+          if (shouldClose) {
+            const priceDiff = currentPrice - grid.longEntryPrice;
+            const grossPnL = priceDiff * grid.longQuantity;
+            const exitNotional = currentPrice * grid.longQuantity;
             const exitFee = (exitNotional * tradingFeePercent) / 100;
+            const netPnL = grossPnL - grid.longEntryFee - exitFee;
 
-            // Net PnL = Brut PnL - Giris Ucreti - Cikis Ucreti
-            const netPnL = grossPnL - grid.entryFee - exitFee;
-
-            // Cross margin: PnL bakiyeye eklenir
             this.balance += grossPnL - exitFee;
             this.totalPnL += netPnL;
             this.totalFees += exitFee;
-            this.currentPosition -= quantity;
+            this.currentPosition -= grid.longQuantity;
 
-            if (netPnL > 0) {
-              this.winCount++;
-            } else {
-              this.lossCount++;
-            }
+            if (netPnL > 0) this.winCount++;
+            else this.lossCount++;
 
-            // Drawdown hesaplama
-            if (this.balance > this.peakBalance) {
-              this.peakBalance = this.balance;
-            }
-            const drawdown =
-              ((this.peakBalance - this.balance) / this.peakBalance) * 100;
-            if (drawdown > this.maxDrawdown) {
-              this.maxDrawdown = drawdown;
-            }
-
-            // Grid'i sifirla - tekrar alis icin hazir
-            grid.hasBuyOrder = true;
-            grid.hasSellOrder = false;
-            grid.entryPrice = null;
-            grid.entryFee = 0;
-            grid.quantity = 0;
-            grid.marginUsed = 0;
-            grid.trailingActivated = false;
-            grid.trailingHighPrice = null;
-            grid.trailingLowPrice = null;
-            grid.trailingTakeProfit = null;
+            this.updateDrawdown();
 
             this.trades.push({
-              type: sellType,
-              price: sellPrice,
-              quantity: quantity,
+              type: closeType,
+              direction: "LONG",
+              price: currentPrice,
+              quantity: grid.longQuantity,
               notional: exitNotional,
               fee: exitFee,
               pnl: netPnL,
               timestamp: timestamp,
               gridLevel: j,
             });
+
+            // Long pozisyonu sifirla
+            grid.hasLongBuyOrder = true;
+            grid.hasLongSellOrder = false;
+            grid.longEntryPrice = null;
+            grid.longQuantity = 0;
+          }
+        }
+
+        // =============== SHORT POZISYON MANTIGI ===============
+        // SHORT GIRIS: Fiyat grid seviyesine veya ustune ciktiysa
+        if (
+          canShort &&
+          grid.hasShortSellOrder &&
+          currentPrice >= grid.price &&
+          currentPrice <= this.config.upperPrice
+        ) {
+          const quantity = this.notionalPerGrid / currentPrice;
+          const entryFee = (this.notionalPerGrid * tradingFeePercent) / 100;
+
+          grid.shortEntryPrice = currentPrice;
+          grid.shortEntryFee = entryFee;
+          grid.shortQuantity = quantity;
+          grid.hasShortSellOrder = false;
+          grid.hasShortBuyOrder = true;
+          grid.shortTargetPrice = grid.price - this.gridStep;
+          grid.shortTrailingLow = currentPrice;
+          grid.shortTrailingHigh = currentPrice * (1 + trailingDownPercent / 100);
+
+          this.balance -= entryFee;
+          this.totalFees += entryFee;
+          this.currentPosition -= quantity;
+
+          this.trades.push({
+            type: "SHORT_SELL",
+            direction: "SHORT",
+            price: currentPrice,
+            quantity: quantity,
+            notional: this.notionalPerGrid,
+            fee: entryFee,
+            timestamp: timestamp,
+            gridLevel: j,
+          });
+        }
+
+        // SHORT KAPAMA: Fiyat hedef fiyata dustu veya trailing tetiklendi
+        if (canShort && grid.hasShortBuyOrder && grid.shortEntryPrice !== null) {
+          let shouldClose = false;
+          let closeType = "SHORT_BUY";
+
+          if (currentPrice <= grid.shortTargetPrice) {
+            shouldClose = true;
+          }
+
+          // Trailing kontrolu (Short icin - ters mantik)
+          if (currentPrice < grid.shortTrailingLow) {
+            grid.shortTrailingLow = currentPrice;
+            grid.shortTrailingHigh = currentPrice * (1 + trailingDownPercent / 100);
+          }
+          if (currentPrice >= grid.shortTrailingHigh) {
+            shouldClose = true;
+            closeType = currentPrice < grid.shortEntryPrice ? "SHORT_TP" : "SHORT_SL";
+          }
+
+          if (shouldClose) {
+            // Short PnL: Giris fiyati - Cikis fiyati (ters)
+            const priceDiff = grid.shortEntryPrice - currentPrice;
+            const grossPnL = priceDiff * grid.shortQuantity;
+            const exitNotional = currentPrice * grid.shortQuantity;
+            const exitFee = (exitNotional * tradingFeePercent) / 100;
+            const netPnL = grossPnL - grid.shortEntryFee - exitFee;
+
+            this.balance += grossPnL - exitFee;
+            this.totalPnL += netPnL;
+            this.totalFees += exitFee;
+            this.currentPosition += grid.shortQuantity;
+
+            if (netPnL > 0) this.winCount++;
+            else this.lossCount++;
+
+            this.updateDrawdown();
+
+            this.trades.push({
+              type: closeType,
+              direction: "SHORT",
+              price: currentPrice,
+              quantity: grid.shortQuantity,
+              notional: exitNotional,
+              fee: exitFee,
+              pnl: netPnL,
+              timestamp: timestamp,
+              gridLevel: j,
+            });
+
+            // Short pozisyonu sifirla
+            grid.hasShortSellOrder = true;
+            grid.hasShortBuyOrder = false;
+            grid.shortEntryPrice = null;
+            grid.shortQuantity = 0;
           }
         }
       }
     }
+  }
 
-    // Acik pozisyonlari son fiyatla degerlendir
+  // Drawdown guncelleme
+  updateDrawdown() {
+    if (this.balance > this.peakBalance) {
+      this.peakBalance = this.balance;
+    }
+    const drawdown = ((this.peakBalance - this.balance) / this.peakBalance) * 100;
+    if (drawdown > this.maxDrawdown) {
+      this.maxDrawdown = drawdown;
+    }
+  }
+
+  // Acik pozisyonlari hesapla ve sonuclari dondur
+  finalizeBacktest(priceData) {
     const lastPrice = priceData[priceData.length - 1].price;
     let unrealizedPnL = 0;
     let openPositionCount = 0;
 
     for (const grid of this.gridLevels) {
-      if (grid.hasSellOrder && grid.entryPrice !== null) {
-        const priceDiff = lastPrice - grid.entryPrice;
-        const grossUnrealized = priceDiff * grid.quantity;
-        // Acik pozisyonlar icin tahmini cikis ucreti (giris ucreti zaten bakiyeden dusuldu)
-        const estimatedExitFee =
-          (lastPrice * grid.quantity * this.config.tradingFeePercent) / 100;
+      // Long acik pozisyonlar
+      if (grid.hasLongSellOrder && grid.longEntryPrice !== null) {
+        const priceDiff = lastPrice - grid.longEntryPrice;
+        const grossUnrealized = priceDiff * grid.longQuantity;
+        const estimatedExitFee = (lastPrice * grid.longQuantity * this.config.tradingFeePercent) / 100;
+        unrealizedPnL += grossUnrealized - estimatedExitFee;
+        openPositionCount++;
+      }
+      // Short acik pozisyonlar
+      if (grid.hasShortBuyOrder && grid.shortEntryPrice !== null) {
+        const priceDiff = grid.shortEntryPrice - lastPrice;
+        const grossUnrealized = priceDiff * grid.shortQuantity;
+        const estimatedExitFee = (lastPrice * grid.shortQuantity * this.config.tradingFeePercent) / 100;
         unrealizedPnL += grossUnrealized - estimatedExitFee;
         openPositionCount++;
       }
@@ -307,10 +403,11 @@ class GridTradingBacktest {
   // Sonuclari olustur
   generateResults(priceData, unrealizedPnL, openPositionCount) {
     const totalTrades = this.trades.length;
-    const buyTrades = this.trades.filter((t) => t.type === "BUY").length;
-    const sellTrades = this.trades.filter((t) => t.type !== "BUY").length;
+    const longTrades = this.trades.filter((t) => t.direction === "LONG").length;
+    const shortTrades = this.trades.filter((t) => t.direction === "SHORT").length;
+    const closedTrades = this.trades.filter((t) => t.pnl !== undefined).length;
     const winRate =
-      sellTrades > 0 ? ((this.winCount / sellTrades) * 100).toFixed(2) : 0;
+      closedTrades > 0 ? ((this.winCount / closedTrades) * 100).toFixed(2) : 0;
     const startPrice = priceData[0].price;
     const endPrice = priceData[priceData.length - 1].price;
     const priceChange = (((endPrice - startPrice) / startPrice) * 100).toFixed(
@@ -333,8 +430,8 @@ class GridTradingBacktest {
         totalReturn: totalReturn,
         maxDrawdown: this.maxDrawdown.toFixed(2),
         totalTrades: totalTrades,
-        buyTrades: buyTrades,
-        sellTrades: sellTrades,
+        longTrades: longTrades,
+        shortTrades: shortTrades,
         openPositions: openPositionCount,
         winCount: this.winCount,
         lossCount: this.lossCount,
@@ -421,6 +518,8 @@ COIN: ${c.coinId.toUpperCase()}/${c.vsCurrency.toUpperCase()}
 Grid Sayisi: ${c.gridCount}
 Alt Fiyat: $${c.lowerPrice}
 Ust Fiyat: $${c.upperPrice}
+Margin Turu: ${c.marginType.toUpperCase()}
+Grid Modu: ${c.gridMode.toUpperCase()}
 Toplam Bakiye: $${c.totalBalance}
 Kullanilan: %${c.balanceUsagePercent}
 Kaldirac: ${c.leverage}x
@@ -443,8 +542,8 @@ Max Drawdown: %${s.maxDrawdown}
 
 --------- ISLEM ISTATISTIKLERI ---------
 Toplam Islem: ${s.totalTrades}
-Alis Islemleri: ${s.buyTrades}
-Satis Islemleri: ${s.sellTrades}
+Long Islemleri: ${s.longTrades}
+Short Islemleri: ${s.shortTrades}
 Acik Pozisyon: ${s.openPositions}
 Kazanan: ${s.winCount}
 Kaybeden: ${s.lossCount}
@@ -488,7 +587,8 @@ async function runBacktest() {
     console.log(`${priceData.length} adet fiyat verisi alindi`);
 
     console.log("Backtest calistiriliyor...");
-    const results = backtest.runBacktest(priceData);
+    backtest.runBacktest(priceData);
+    const results = backtest.finalizeBacktest(priceData);
 
     // Detayli sonuclari konsola yazdir
     const detailedOutput = formatDetailedResults(results);
